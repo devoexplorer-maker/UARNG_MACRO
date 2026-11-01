@@ -1,0 +1,962 @@
+"""
+UA RNG Fisher v1.3 — by DevoExplorer
+Auto-fishing macro for Underground Artist RNG (Roblox).
+Built on the ABA Macro v8 framework (global hotkey hook, window-relative
+calibration, queued logging, themes, overlay).
+
+Loop:  press E at a fishing spot  ->  "Waiting for a bite"  ->
+       "A bite! Hold E to reel!"  ->  hold/release E to keep the green zone
+       on the fish  ->  catch (auto-sold)  ->  press E again.
+"""
+import tkinter as tk
+import tkinter.ttk as ttk
+import threading, time, json, os, sys, ctypes, collections, webbrowser
+import keyboard
+from PIL import Image, ImageGrab, ImageTk
+
+# mss grabs small screen regions ~5x faster than PIL — less lag = less wobble.
+try:
+    import mss as _mss
+    _MSS_OK = True
+except ImportError:
+    _MSS_OK = False
+_tls = threading.local()
+
+# Make screen coords == screenshot pixels on scaled (125%/150%) displays.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try: ctypes.windll.user32.SetProcessDPIAware()
+    except Exception: pass
+
+user32 = ctypes.windll.user32
+
+APP_TITLE = "UA RNG FISHER"
+VERSION   = "v1.3"
+LINK_YT = "https://youtube.com/@devexplorer-k6f?si=XOZR8DrhbG0Oa_yv"
+LINK_DC = "https://discord.gg/TsBDySsJ9v"
+LINK_TT = "https://www.tiktok.com/@devoexplorer?_r=1&_t=ZT-94yX9VcDT7F"
+
+# ── KEY NAMES ──────────────────────────────────────────────────
+_KEYSYM_MAP = {
+    "bracketleft":"[", "bracketright":"]", "backslash":"\\", "slash":"/",
+    "semicolon":";", "apostrophe":"'", "quoteright":"'", "quoteleft":"`",
+    "comma":",", "period":".", "minus":"-", "equal":"=", "grave":"`", "plus":"+",
+    "escape":"esc", "return":"enter", "prior":"page up", "next":"page down",
+}
+def kbd_key(name):
+    if not name: return name
+    low = str(name).strip().lower()
+    return _KEYSYM_MAP.get(low, low)
+
+# ── SCREEN HELPERS ─────────────────────────────────────────────
+def sample(x, y):
+    try: return ImageGrab.grab(bbox=(x, y, x+1, y+1)).getpixel((0, 0))[:3]
+    except Exception: return (0, 0, 0)
+
+def color_close(a, b, tol):
+    return all(abs(int(a[i]) - int(b[i])) <= tol for i in range(3))
+
+def get_roblox_rect():
+    """(x, y, w, h) of the Roblox client area in screen coords, or None."""
+    try:
+        hwnd = user32.FindWindowW(None, "Roblox")
+        if not hwnd: return None
+        class RECT(ctypes.Structure):
+            _fields_ = [("l",ctypes.c_long),("t",ctypes.c_long),("r",ctypes.c_long),("b",ctypes.c_long)]
+        class PT(ctypes.Structure):
+            _fields_ = [("x",ctypes.c_long),("y",ctypes.c_long)]
+        rc = RECT(); user32.GetClientRect(hwnd, ctypes.byref(rc))
+        pt = PT(); user32.ClientToScreen(hwnd, ctypes.byref(pt))
+        if rc.r <= 0 or rc.b <= 0: return None
+        return (pt.x, pt.y, rc.r, rc.b)
+    except Exception:
+        return None
+
+def roblox_focused():
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(user32.GetForegroundWindow(), buf, 256)
+        return "roblox" in buf.value.lower()
+    except Exception:
+        return False
+
+def resolve_point(cfg, key):
+    """Window-relative point if saved that way and Roblox is open, else absolute."""
+    frac = cfg.get("_frac", {}).get(key)
+    if frac:
+        rect = get_roblox_rect()
+        if rect:
+            rx, ry, rw, rh = rect
+            return (int(rx + frac[0]*rw), int(ry + frac[1]*rh))
+    p = cfg.get(key)
+    return tuple(p) if p else None
+
+def resolve_box(cfg, key):
+    frac = cfg.get("_frac", {}).get(key)
+    if frac:
+        rect = get_roblox_rect()
+        if rect:
+            rx, ry, rw, rh = rect
+            return (int(rx + frac[0]*rw), int(ry + frac[1]*rh), int(frac[2]*rw), int(frac[3]*rh))
+    b = cfg.get(key)
+    return tuple(b) if b else None
+
+# ── REEL BAR VISION ────────────────────────────────────────────
+# Track = very dark bar. Green zone = the green block you control.
+# Fish  = the blue fish icon you have to keep inside the green zone.
+def _is_green(c): return c[1] > 90 and c[1] > c[0] + 30 and c[1] > c[2] + 15
+def _is_fish(c):  return c[2] > 140 and c[2] > c[0] + 40 and c[2] >= c[1]
+def _is_dark(c):  return c[0] < 60 and c[1] < 60 and c[2] < 70
+
+try:
+    import numpy as _np
+    _NP_OK = True
+except ImportError:
+    _NP_OK = False
+
+def _empty(W): return {"active": False, "W": W, "g0": None, "g1": None, "fish": None}
+
+def analyze_img(img, band=False):
+    """Return {'active', 'W', 'g0', 'g1', 'fish'} for a crop of the reel track.
+    'active' = the track is on screen (dark bar + a green zone and/or the fish).
+    g0/g1 may be None when a big fish (whale) covers the whole green zone."""
+    img = img.convert("RGB"); W, H = img.size
+    res = _empty(W)
+    if W < 10 or H < 3: return res
+    y0, y1 = (0, H) if band else (int(H*0.2), max(int(H*0.2)+1, int(H*0.8)))
+    if _NP_OK:
+        # Every pixel column, every row in the middle band — pixel-exact and fast.
+        a = _np.asarray(img, dtype=_np.int16)[y0:y1]
+        r, g, b = a[..., 0], a[..., 1], a[..., 2]
+        green = (g > 90) & (g > r + 30) & (g > b + 15)
+        fish  = (b > 140) & (b > r + 40) & (b >= g) & ~green
+        dark  = (r < 60) & (g < 60) & (b < 70)
+        gcols = _np.nonzero(green.sum(axis=0) >= 2)[0]
+        fcnt  = fish.sum(axis=0)
+        dfrac = dark.mean()
+        gx = gcols.tolist()
+        fx_ok = fcnt.sum() >= 4
+        fish_x = float((fcnt * _np.arange(W)).sum() / fcnt.sum()) if fx_ok else None
+    else:
+        px = img.load(); ystep = max(1, (y1-y0)//7)
+        gx, fxs = [], []; dark = total = 0
+        for x in range(W):
+            gc = 0
+            for y in range(y0, y1, ystep):
+                c = px[x, y]; total += 1
+                if _is_green(c): gc += 1
+                elif _is_fish(c): fxs.append(x)
+                elif _is_dark(c): dark += 1
+            if gc: gx.append(x)
+        dfrac = dark/total if total else 0
+        fish_x = sum(fxs)/len(fxs) if len(fxs) >= 4 else None
+    if dfrac < 0.05: return res
+    if len(gx) >= 3:
+        res["active"] = True; res["g0"], res["g1"] = gx[0], gx[-1]
+        res["fish"] = fish_x
+    elif fish_x is not None and dfrac >= 0.25:
+        # Fish on a dark track but no green visible: zone is hidden under a big
+        # fish. Only trusted by the engine while a reel is already in progress.
+        res["fish_only"] = True; res["fish"] = fish_x
+    return res
+
+def grab_box(bx, by, bw, bh):
+    if _MSS_OK:
+        sct = getattr(_tls, "sct", None)
+        if sct is None:
+            sct = _mss.mss(); _tls.sct = sct   # one instance per thread (mss isn't thread-safe)
+        raw = sct.grab({"left": bx, "top": by, "width": bw, "height": bh})
+        return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+    return ImageGrab.grab(bbox=(bx, by, bx+bw, by+bh))
+
+def analyze_box(box):
+    bx, by, bw, bh = box
+    y0 = int(bh*0.2); h = max(1, int(bh*0.8) - y0)
+    try: img = grab_box(bx, by + y0, bw, h)      # middle band only
+    except Exception: return _empty(bw)
+    return analyze_img(img, band=True)
+
+def _slopes(hist, now, win):
+    """Least-squares speed (px/s) of zone centre and fish over the last `win` sec.
+    A line fit over many samples is far less jumpy than frame-to-frame differences."""
+    pts = [h for h in hist if now - h[0] <= win]
+    if len(pts) < 3: return 0.0, 0.0
+    t0 = pts[0][0]; ts = [p[0]-t0 for p in pts]; mt = sum(ts)/len(ts)
+    den = sum((t-mt)**2 for t in ts) or 1e-9
+    def sl(i):
+        ys = [p[i] for p in pts]; my = sum(ys)/len(ys)
+        return sum((t-mt)*(y-my) for t, y in zip(ts, ys)) / den
+    return sl(1), sl(2)
+
+def play_sound(kind="start"):
+    try:
+        import winsound
+        tone = {"start": (800,150), "stop": (400,150), "catch": (1000,80)}.get(kind, (600,100))
+        threading.Thread(target=lambda: winsound.Beep(*tone), daemon=True).start()
+    except Exception: pass
+
+class ToolTip:
+    def __init__(self, widget, text, delay=700):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip = None; self._id = None
+        widget.bind("<Enter>", self._schedule, add="+"); widget.bind("<Leave>", self._cancel, add="+")
+    def _schedule(self, e=None):
+        self._cancel(); self._id = self.widget.after(self.delay, self._show)
+    def _cancel(self, e=None):
+        if self._id: self.widget.after_cancel(self._id); self._id = None
+        if self.tip: self.tip.destroy(); self.tip = None
+    def _show(self):
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True); tw.wm_geometry(f"+{x}+{y}"); tw.attributes("-topmost", True)
+        tk.Label(tw, text=self.text, bg="#1a1a24", fg="#cccccc", font=("Consolas", 8),
+                 relief="solid", borderwidth=1, padx=6, pady=3, wraplength=260, justify="left").pack()
+
+# ── CONFIG ─────────────────────────────────────────────────────
+THEMES = {
+    "default":    {"BG":"#0d0d0f","CARD":"#16161a","ACC":"#e8384f","ACC2":"#ff6b35","FG":"#f0f0f0","DIM":"#6b6b7a","ENT":"#0a0a0d"},
+    "ocean":      {"BG":"#000a0d","CARD":"#001520","ACC":"#00bcd4","ACC2":"#0097a7","FG":"#e0f7fa","DIM":"#2a6070","ENT":"#000608"},
+    "void":       {"BG":"#08000d","CARD":"#100018","ACC":"#aa44ff","ACC2":"#cc77ff","FG":"#e8d0ff","DIM":"#5a3a7a","ENT":"#050008"},
+    "matrix":     {"BG":"#000d00","CARD":"#001a00","ACC":"#00ff41","ACC2":"#00cc33","FG":"#00ff41","DIM":"#005500","ENT":"#000800"},
+    "gold":       {"BG":"#0d0a00","CARD":"#1a1400","ACC":"#ffcc00","ACC2":"#ffaa00","FG":"#fff0c0","DIM":"#7a6000","ENT":"#080600"},
+    "lightning":  {"BG":"#080808","CARD":"#111111","ACC":"#00cfff","ACC2":"#66e8ff","FG":"#e8f8ff","DIM":"#3a5a66","ENT":"#050505"},
+    "neon-pink":  {"BG":"#0d000d","CARD":"#1a0018","ACC":"#ff00ff","ACC2":"#ff66cc","FG":"#ffe0ff","DIM":"#6b2a6b","ENT":"#080008"},
+    "pumpkin":    {"BG":"#0d0600","CARD":"#1a0d00","ACC":"#ff7518","ACC2":"#a64dff","FG":"#ffe8d0","DIM":"#7a4a20","ENT":"#080400"},
+    "blood-moon": {"BG":"#0d0000","CARD":"#1a0505","ACC":"#ff1a1a","ACC2":"#8b0000","FG":"#ffd0d0","DIM":"#6b2a2a","ENT":"#080000"},
+}
+
+DEFAULTS = {
+    "start_key":"[", "stop_key":"]", "close_key":"\\", "snap_key":"f8",
+    "reel_mode":"track", "invert":False, "track_kd":0.35, "track_dead":0.0,
+    "tap_gap":0.12, "cast_cd":2.5, "post_catch":1.5, "recast_timeout":30.0, "max_reel":90.0,
+    "stop_btn":None, "stop_rgb":None, "reel_box":None, "color_tol":45,
+    "sounds_enabled":True, "ui_theme":"default", "overlay_opacity":0.88,
+    "_frac":{},
+}
+
+def _base_dir():
+    return os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+def cfg_path(): return os.path.join(_base_dir(), "ua_fisher_settings.json")
+
+def load_cfg():
+    o = dict(DEFAULTS)
+    try:
+        with open(cfg_path()) as f: o.update(json.load(f))
+    except Exception: pass
+    if not isinstance(o.get("_frac"), dict): o["_frac"] = {}
+    return o
+
+def save_cfg(s):
+    try:
+        with open(cfg_path(), "w") as f: json.dump(s, f, indent=2)
+    except Exception: pass
+
+# ── ENGINE ─────────────────────────────────────────────────────
+class Engine:
+    def __init__(self):
+        self.running = False; self.cfg = None
+        self.log_cb = self.status_cb = self.stats_cb = None
+        self.catches = 0
+
+    def log(self, m):
+        if self.log_cb: self.log_cb(m)
+
+    def start(self, cfg):
+        if self.running: return
+        self.cfg = cfg; self.running = True; self.catches = 0
+        if self.stats_cb: self.stats_cb(0)
+        if not cfg.get("reel_box"):
+            self.log("⚠ Reel bar not set — open SETUP and snap it first!")
+        if not cfg.get("stop_btn"):
+            self.log("⚠ Stop button not set — using slow timer recasts")
+        threading.Thread(target=self._fish_loop, daemon=True).start()
+        if cfg.get("sounds_enabled", True): play_sound("start")
+        if self.status_cb: self.status_cb(True)
+
+    def stop(self):
+        was = self.running; self.running = False
+        try: keyboard.release("e")
+        except Exception: pass
+        if was and self.cfg and self.cfg.get("sounds_enabled", True): play_sound("stop")
+        if self.status_cb: self.status_cb(False)
+
+    def _tap_e(self, hold=0.07):
+        keyboard.press("e"); time.sleep(hold); keyboard.release("e")
+
+    def _fish_loop(self):
+        cfg = self.cfg
+        holding = False
+        def hold(on):
+            nonlocal holding
+            if on and not holding:   keyboard.press("e");   holding = True
+            elif not on and holding: keyboard.release("e"); holding = False
+
+        reeling = False; reel_start = 0.0; lost_since = None
+        last_cast = 0.0; last_reel_end = 0.0
+        hist = collections.deque(maxlen=40)     # (t, zone_centre, fish_x)
+        last_fish = None; vz = vf = 0.0
+        last_focus_warn = 0.0; last_dbg = 0.0
+        self.log("=== FISHING STARTED ===")
+
+        while self.running:
+            try:
+                now = time.time()
+                if not roblox_focused():
+                    hold(False)
+                    if now - last_focus_warn > 5:
+                        self.log("Waiting — click into Roblox so it's the focused window")
+                        last_focus_warn = now
+                    time.sleep(0.25); continue
+
+                box = resolve_box(cfg, "reel_box")
+                r = analyze_box(box) if box else _empty(0)
+                seen = r["active"] or (reeling and r.get("fish_only"))
+
+                # A single bad frame (flash, whale covering the zone, frame tear)
+                # must not end the reel and drop E mid-fight.
+                if reeling and not seen:
+                    if lost_since is None: lost_since = now
+                    if now - lost_since < 0.3:
+                        time.sleep(0.004); continue
+                else:
+                    lost_since = None
+
+                # ── REELING ──
+                if seen:
+                    if not reeling:
+                        reeling = True; reel_start = now
+                        hist.clear(); last_fish = None; vz = vf = 0.0
+                        self.log(">> Bite! Reeling...")
+                    if now - reel_start > float(cfg.get("max_reel", 90)):
+                        hold(False); self.log("Reel ran too long — letting go")
+                        reel_start = now; time.sleep(1.0); continue
+
+                    mode = cfg.get("reel_mode", "track")
+                    if mode == "hold":
+                        hold(True)
+                    elif mode == "tap":
+                        hold(True); time.sleep(0.05); hold(False)
+                        time.sleep(float(cfg.get("tap_gap", 0.12)))
+                    else:
+                        # PD control on the gap between fish and zone centre, plus how
+                        # fast that gap is changing (line-fit over the last 50 ms), so it
+                        # brakes before sliding past the fish.
+                        W = r["W"]
+                        fish = r["fish"] if r["fish"] is not None else last_fish
+                        zc = (r["g0"] + r["g1"]) / 2.0 if r["g0"] is not None else fish  # zone hidden under fish => on target
+                        if fish is not None and zc is not None:
+                            last_fish = fish
+                            hist.append((now, zc, fish))
+                            vz, vf = _slopes(hist, now, 0.05)
+                            ve = vf - vz
+                            u = (fish - zc) + float(cfg.get("track_kd", 0.35)) * ve
+                            db = float(cfg.get("track_dead", 0.0)) * W
+                            if u > db:    want = True           # zone needs to go right
+                            elif u < -db: want = False          # zone needs to go left
+                            else:         want = ve > 0         # on target: lean with the fish
+                            if cfg.get("invert", False): want = not want
+                            hold(want)
+                            if now - last_dbg > 1.0:
+                                self.log(f"  gap {fish - zc:+.0f}px  zone {vz:+.0f}  fish {vf:+.0f}px/s  E={'held' if holding else 'up'}")
+                                last_dbg = now
+                    time.sleep(0.002)
+                    continue
+
+                # ── NOT REELING ──
+                hold(False)
+                if reeling:
+                    reeling = False; last_reel_end = now
+                    dur = now - reel_start
+                    if dur >= 0.6:
+                        self.catches += 1
+                        if self.stats_cb: self.stats_cb(self.catches)
+                        if cfg.get("sounds_enabled", True): play_sound("catch")
+                        self.log(f">> Reel finished ({dur:.1f}s) — #{self.catches}")
+
+                stop_pt = resolve_point(cfg, "stop_btn"); stop_rgb = cfg.get("stop_rgb")
+                calibrated = bool(stop_pt and stop_rgb)
+                if calibrated and color_close(sample(*stop_pt), stop_rgb, int(cfg.get("color_tol", 45))):
+                    time.sleep(0.08); continue          # "Waiting for a bite" is up — just wait
+
+                post_ok = now - last_reel_end >= float(cfg.get("post_catch", 1.5))
+                if calibrated:
+                    ready = post_ok and now - last_cast >= float(cfg.get("cast_cd", 2.5))
+                else:
+                    just_caught = last_reel_end > last_cast
+                    ready = (post_ok and just_caught) or now - last_cast >= float(cfg.get("recast_timeout", 30))
+                if ready:
+                    self._tap_e(); last_cast = now
+                    self.log(">> Cast (E)")
+                time.sleep(0.1)
+            except Exception as e:
+                hold(False); self.log(f"Error: {e}"); time.sleep(0.5)
+        hold(False)
+        self.log("=== STOPPED ===")
+
+# ── APP ────────────────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_cfg()
+        t = THEMES.get(self.cfg.get("ui_theme", "default"), THEMES["default"])
+        self.BG, self.CARD, self.ACC, self.ACC2 = t["BG"], t["CARD"], t["ACC"], t["ACC2"]
+        self.FG, self.DIM, self.ENT = t["FG"], t["DIM"], t["ENT"]
+
+        self.eng = Engine()
+        self.eng.log_cb = self._log; self.eng.status_cb = self._set_status; self.eng.stats_cb = self._set_catches
+        self._log_lines = collections.deque(maxlen=400)
+        self._log_pending = collections.deque(maxlen=4000)
+        self._hk_flags = {"start":False, "stop":False, "close":False, "snap":False}
+        self._global_hook = None; self._snap_armed = False
+        self._lv = self._ll = self._lk = self._kh = None
+        self._picking = False; self._overlay = None; self._session_start = None
+        self._catch_count = 0; self._v = {}
+
+        self.title(f"{APP_TITLE} {VERSION}")
+        self.configure(bg=self.BG); self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        sc = max(1.0, self.winfo_fpixels('1i') / 96.0)
+        w, h = int(390*sc), int(600*sc)
+        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth()-w)//2}+{(self.winfo_screenheight()-h)//2}")
+
+        self._build(); self._rebind()
+        self.bind_all("<Button-1>", self._unfocus, add="+")
+        self.after(40, self._poll_hotkeys)
+        self.after(80, self._drain_logs)
+        self.after(500, self._startup_checks)
+
+    # ── small widget helpers ──
+    def _lbl(self, parent, text, fg=None, size=8, bold=False, bg=None, **kw):
+        return tk.Label(parent, text=text, bg=bg or self.CARD, fg=fg or self.DIM,
+                        font=("Consolas", size, "bold" if bold else "normal"), **kw)
+
+    def _check(self, parent, text, key, tip=None):
+        v = tk.BooleanVar(value=bool(self.cfg.get(key))); self._v[key] = (v, bool)
+        cb = tk.Checkbutton(parent, text=text, variable=v, bg=self.CARD, fg=self.DIM, selectcolor=self.ENT,
+                            activebackground=self.CARD, font=("Consolas", 8), highlightthickness=0)
+        cb.pack(anchor="w")
+        if tip: ToolTip(cb, tip)
+
+    def _spin(self, parent, text, key, lo, hi, inc, unit="", tip=None, cast=float):
+        r = tk.Frame(parent, bg=self.CARD); r.pack(anchor="w", pady=1)
+        self._lbl(r, text, width=18, anchor="w").pack(side="left")
+        v = tk.StringVar(value=str(self.cfg.get(key, DEFAULTS.get(key)))); self._v[key] = (v, cast)
+        tk.Spinbox(r, from_=lo, to=hi, increment=inc, textvariable=v, width=5, bg=self.ENT, fg=self.FG,
+                   font=("Consolas", 9), relief="flat", buttonbackground=self.ENT,
+                   highlightthickness=1, highlightbackground="#2a2a35").pack(side="left", padx=4)
+        if unit: self._lbl(r, unit).pack(side="left")
+        if tip: ToolTip(r, tip)
+
+    def _sep(self, parent):
+        tk.Frame(parent, bg="#2a2a35", height=1).pack(fill="x", pady=(5, 5))
+
+    def _section(self, title):
+        hdr = tk.Frame(self, bg=self.BG); hdr.pack(fill="x", padx=20, pady=(4, 0))
+        lbl = self._lbl(hdr, f"▶ {title}  (click to expand)", bold=True, bg=self.BG, cursor="hand2")
+        lbl.pack(anchor="w")
+        body = tk.Frame(self, bg=self.CARD)
+        inner = tk.Frame(body, bg=self.CARD); inner.pack(fill="x", padx=14, pady=8)
+        st = {"open": False}
+        def toggle(e=None):
+            if st["open"]:
+                body.pack_forget(); lbl.config(text=f"▶ {title}  (click to expand)")
+            else:
+                body.pack(fill="x", padx=20, pady=(0, 6), after=hdr); lbl.config(text=f"▼ {title}  (click to collapse)")
+            st["open"] = not st["open"]
+        lbl.bind("<Button-1>", toggle)
+        return inner
+
+    def _build(self):
+        B, C, A, A2, F, D = self.BG, self.CARD, self.ACC, self.ACC2, self.FG, self.DIM
+
+        # Header
+        hdr = tk.Frame(self, bg=B); hdr.pack(fill="x", padx=20, pady=(14, 0))
+        tk.Label(hdr, text="🎣", bg=B, fg=A, font=("Segoe UI Emoji", 16)).pack(side="left")
+        tk.Label(hdr, text=f" {APP_TITLE}", bg=B, fg=F, font=("Consolas", 15, "bold")).pack(side="left")
+        self._log_canvas = tk.Canvas(hdr, width=18, height=16, bg=B, highlightthickness=0, cursor="hand2")
+        self._log_canvas.pack(side="right", padx=(0, 2)); self._log_open = False
+        def _draw_log_icon(hov=False):
+            c = self._log_canvas; c.delete("all"); col = self.ACC if hov else self.DIM
+            if not self._log_open:
+                for y in (4, 8, 12): c.create_line(2, y, 16, y, fill=col, width=1.5)
+            else:
+                c.create_line(3, 5, 9, 12, fill=col, width=1.5); c.create_line(15, 5, 9, 12, fill=col, width=1.5)
+        self._draw_log_icon = _draw_log_icon; _draw_log_icon()
+        self._log_canvas.bind("<Button-1>", lambda e: self._toggle_log())
+        self._log_canvas.bind("<Enter>", lambda e: _draw_log_icon(True))
+        self._log_canvas.bind("<Leave>", lambda e: _draw_log_icon(False))
+        ToolTip(self._log_canvas, "Show/hide full log output")
+        tk.Label(self, text=f"Underground Artist RNG Auto-Fisher  •  by DevoExplorer  {VERSION}",
+                 bg=B, fg=D, font=("Consolas", 8)).pack(pady=(2, 0))
+
+        # Social links
+        social = tk.Frame(self, bg=B); social.pack(pady=(2, 6))
+        ytc = tk.Canvas(social, width=34, height=24, bg=B, highlightthickness=0, cursor="hand2"); ytc.pack(side="left", padx=5)
+        def _yt(col):
+            ytc.delete("all"); r = 5; x1, y1, x2, y2 = 1, 1, 33, 23
+            for (ax, ay, s) in ((x1, y1, 90), (x2-2*r, y1, 0), (x1, y2-2*r, 180), (x2-2*r, y2-2*r, 270)):
+                ytc.create_arc(ax, ay, ax+2*r, ay+2*r, start=s, extent=90, fill=col, outline=col)
+            ytc.create_rectangle(x1+r, y1, x2-r, y2, fill=col, outline=col)
+            ytc.create_rectangle(x1, y1+r, x2, y2-r, fill=col, outline=col)
+            ytc.create_polygon(13, 7, 13, 17, 23, 12, fill="white")
+        _yt("#550000")
+        ytc.bind("<Enter>", lambda e: _yt("#ff0000")); ytc.bind("<Leave>", lambda e: _yt("#550000"))
+        ytc.bind("<Button-1>", lambda e: webbrowser.open(LINK_YT))
+        dcc = tk.Canvas(social, width=26, height=22, bg=B, highlightthickness=0, cursor="hand2"); dcc.pack(side="left", padx=5)
+        def _dc(col):
+            dcc.delete("all")
+            dcc.create_arc(1, 1, 25, 21, start=0, extent=180, fill=col, outline="")
+            dcc.create_rectangle(1, 11, 25, 17, fill=col, outline="")
+            dcc.create_arc(1, 9, 9, 21, start=180, extent=180, fill=col, outline="")
+            dcc.create_arc(17, 9, 25, 21, start=180, extent=180, fill=col, outline="")
+            dcc.create_oval(6, 7, 11, 12, fill="white", outline=""); dcc.create_oval(15, 7, 20, 12, fill="white", outline="")
+        _dc("#1e2060")
+        dcc.bind("<Enter>", lambda e: _dc("#5865F2")); dcc.bind("<Leave>", lambda e: _dc("#1e2060"))
+        dcc.bind("<Button-1>", lambda e: webbrowser.open(LINK_DC))
+        ttc = tk.Canvas(social, width=22, height=24, bg=B, highlightthickness=0, cursor="hand2"); ttc.pack(side="left", padx=5)
+        def _tt(col):
+            ttc.delete("all")
+            ttc.create_rectangle(13, 3, 16, 18, fill=col, outline="")
+            ttc.create_arc(13, 1, 22, 10, start=0, extent=90, fill=col, outline="")
+            ttc.create_rectangle(16, 3, 19, 6, fill=col, outline="")
+            ttc.create_oval(5, 14, 15, 23, fill=col, outline=""); ttc.create_oval(7, 16, 13, 21, fill=B, outline="")
+        _tt("#333340")
+        ttc.bind("<Enter>", lambda e: _tt("#ff0050")); ttc.bind("<Leave>", lambda e: _tt("#333340"))
+        ttc.bind("<Button-1>", lambda e: webbrowser.open(LINK_TT))
+
+        # Status bar
+        sc = tk.Frame(self, bg=C); sc.pack(fill="x", padx=20, pady=(0, 6))
+        si = tk.Frame(sc, bg=C); si.pack(fill="x", padx=14, pady=8)
+        self._dot = tk.Label(si, text="●", bg=C, fg="#2a2a35", font=("Consolas", 16)); self._dot.pack(side="left")
+        self._slbl = tk.Label(si, text="  OFFLINE", bg=C, fg=D, font=("Consolas", 12, "bold")); self._slbl.pack(side="left")
+        self._btn = tk.Button(si, text="START", bg=A, fg="white", font=("Consolas", 10, "bold"), relief="flat",
+                              padx=14, pady=5, cursor="hand2", activebackground="#c0202f", command=self._toggle)
+        self._btn.pack(side="right")
+        self._status_card = sc
+
+        from tkinter import scrolledtext as _st
+        self._log_panel = _st.ScrolledText(self, bg="#0a0a0d", fg=A2, font=("Consolas", 7), height=7, relief="flat",
+                                           highlightthickness=1, highlightbackground="#1a1a24", state="disabled")
+
+        # HOTKEYS
+        hk = self._section("HOTKEYS")
+        for lbl, key in (("Start / Stop", "start_key"), ("Stop", "stop_key"), ("Force Close", "close_key"), ("Snap Reel Bar", "snap_key")):
+            self._hotkey_row(hk, lbl, key)
+
+        # FISHING OPTIONS
+        op = self._section("FISHING")
+        r = tk.Frame(op, bg=C); r.pack(anchor="w", pady=1)
+        self._lbl(r, "Reel mode:", width=18, anchor="w").pack(side="left")
+        mv = tk.StringVar(value=self.cfg.get("reel_mode", "track")); self._v["reel_mode"] = (mv, str)
+        ttk.Combobox(r, textvariable=mv, values=["track", "hold", "tap"], width=8, state="readonly",
+                     font=("Consolas", 8)).pack(side="left", padx=4)
+        self._lbl(op, "track = keep green zone on the fish (recommended)\nhold  = just hold E the whole reel\ntap   = rapid-tap E",
+                  fg="#666680", size=7, justify="left").pack(anchor="w", pady=(0, 3))
+        self._check(op, "Invert hold direction", "invert",
+                    "Turn on if the green zone runs AWAY from the fish (means holding E moves it left in your setup).")
+        self._spin(op, "Damping:", "track_kd", 0.0, 0.8, 0.05, "",
+                   "Brakes the zone before it passes the fish. RAISE if it bounces back and forth, LOWER if it lags behind the fish.")
+        self._spin(op, "Dead zone:", "track_dead", 0.0, 0.1, 0.005, "of bar",
+                   "How close counts as 'on the fish'. Leave at 0 unless it jitters when it's already on target.")
+        self._spin(op, "Tap gap (tap mode):", "tap_gap", 0.03, 1.0, 0.01, "sec")
+        self._sep(op)
+        self._spin(op, "Recast cooldown:", "cast_cd", 0.5, 10, 0.5, "sec", "Min time between E presses when idle.")
+        self._spin(op, "After-catch delay:", "post_catch", 0.0, 10, 0.5, "sec", "Pause after a catch before recasting.")
+        self._spin(op, "No-calib recast:", "recast_timeout", 5, 120, 5, "sec",
+                   "Only used if the Stop button isn't calibrated — recasts this often as a fallback.")
+        self._spin(op, "Max reel time:", "max_reel", 10, 300, 5, "sec", "Safety: let go of E if a reel lasts longer than this.")
+        self._sep(op)
+        self._check(op, "Status sounds (beep on start/stop/catch)", "sounds_enabled")
+
+        # SETUP
+        su = self._section("SETUP")
+        self._lbl(su, "HOW TO SET UP:\n"
+                      "1. Sit on a fishing spot until the  [E] Fish\n"
+                      "   prompt pops up.\n"
+                      "2. Press E once so it says 'Waiting for a bite'.\n"
+                      "   Click 'Set Stop Button', then within 3s hover\n"
+                      "   the RED part of the Stop button (not the text).\n"
+                      "3. Click 'Snap Reel Bar'. When 'A bite! Hold E to\n"
+                      "   reel!' shows up, press F8. Drag a tight box\n"
+                      "   around the dark bar with the green zone + fish.\n"
+                      "4. Hit SAVE, click into Roblox, press START.\n\n"
+                      "No selling needed — the game auto-sells catches.\n"
+                      "Keep Roblox on your main monitor and focused.",
+                  fg=D, justify="left").pack(anchor="w", pady=(0, 6))
+        self._setup_rows = {}
+        for key, label, cmd in (("stop_btn", "Set Stop Button", self._pick_stop),
+                                ("reel_box", "Snap Reel Bar", self._arm_snap)):
+            rr = tk.Frame(su, bg=C); rr.pack(fill="x", pady=2)
+            tk.Button(rr, text=label, bg="#1a1a24", fg=A2, font=("Consolas", 8), relief="flat", padx=8, pady=3,
+                      cursor="hand2", activebackground="#252535", command=cmd, width=16).pack(side="left")
+            is_set = bool(self.cfg.get(key))
+            lab = self._lbl(rr, "set" if is_set else "not set", fg=A if is_set else D)
+            lab.pack(side="left", padx=8); self._setup_rows[key] = lab
+        tr = tk.Frame(su, bg=C); tr.pack(fill="x", pady=(6, 0))
+        tk.Button(tr, text="Test Detection", bg="#1a1a24", fg=D, font=("Consolas", 8), relief="flat", padx=8, pady=3,
+                  cursor="hand2", activebackground="#252535", command=self._test_detect).pack(side="left")
+        self._spin(su, "Stop colour tolerance:", "color_tol", 10, 100, 5, cast=int,
+                   tip="How close the Stop button colour must match. Raise if 'waiting' isn't being detected.")
+
+        # SAVE + stats
+        sr = tk.Frame(self, bg=B); sr.pack(pady=(4, 2))
+        tk.Button(sr, text="SAVE", bg="#1a1a24", fg=A2, font=("Consolas", 9, "bold"), relief="flat", padx=14, pady=4,
+                  cursor="hand2", activebackground="#252535", command=self._save).pack()
+        st = tk.Frame(self, bg=B); st.pack(fill="x", padx=20, pady=(0, 4))
+        self._session_lbl = tk.Label(st, text="", bg=B, fg=D, font=("Consolas", 8)); self._session_lbl.pack(side="left")
+        self._catch_lbl = tk.Label(st, text="🐟 0", bg=B, fg=A2, font=("Consolas", 8, "bold")); self._catch_lbl.pack(side="left", padx=10)
+        self._status_line = tk.Label(st, text="", bg=B, fg=A, font=("Consolas", 8), anchor="e")
+        self._status_line.pack(side="right", fill="x", expand=True)
+        self._tick_session()
+
+        # Theme / overlay bar
+        tb = tk.Frame(self, bg=C); tb.pack(fill="x", padx=20, pady=(2, 8))
+        tbi = tk.Frame(tb, bg=C); tbi.pack(fill="x", padx=10, pady=6)
+        self._lbl(tbi, "Theme:").pack(side="left")
+        self._theme_var = tk.StringVar(value=self.cfg.get("ui_theme", "default"))
+        tm = ttk.Combobox(tbi, textvariable=self._theme_var, values=list(THEMES.keys()), width=10,
+                          state="readonly", font=("Consolas", 8))
+        tm.pack(side="left", padx=(4, 8)); tm.bind("<<ComboboxSelected>>", self._change_theme)
+        self._overlay_btn = tk.Button(tbi, text="⬡ Overlay", bg=A, fg="white", font=("Consolas", 7, "bold"), relief="flat",
+                                      padx=8, pady=2, cursor="hand2", command=self._toggle_overlay)
+        self._overlay_btn.pack(side="left", padx=(0, 8))
+        ToolTip(self._overlay_btn, "Small always-on-top HUD with status and catch count")
+        self._lbl(tbi, "Opacity:").pack(side="left")
+        self._ov_opacity = tk.DoubleVar(value=self.cfg.get("overlay_opacity", 0.88))
+        tk.Scale(tbi, from_=0.3, to=1.0, resolution=0.05, orient="horizontal", variable=self._ov_opacity, bg=C, fg=D,
+                 troughcolor=self.ENT, highlightthickness=0, length=70, showvalue=False,
+                 command=self._update_ov_opacity).pack(side="left", padx=2)
+
+    # ── HOTKEY CAPTURE ──
+    def _hotkey_row(self, parent, label, key):
+        r = tk.Frame(parent, bg=self.CARD); r.pack(fill="x", pady=2)
+        self._lbl(r, label, size=9, width=14, anchor="w").pack(side="left")
+        var = tk.StringVar(value=self.cfg.get(key, "")); self._v[key] = (var, str)
+        lbl = tk.Label(r, textvariable=var, bg=self.ENT, fg=self.FG, font=("Consolas", 10), width=10, cursor="hand2",
+                       highlightthickness=1, highlightbackground="#2a2a35")
+        lbl.pack(side="right"); lbl.bind("<Button-1>", lambda e, v=var, l=lbl, k=key: self._listen(v, l, k))
+
+    def _listen(self, var, lbl, key):
+        self._cancel_listen(); self._lv, self._ll, self._lk = var, lbl, key
+        lbl.config(fg=self.ACC2, highlightbackground=self.ACC2); var.set("Press a key...")
+        self._kh = keyboard.on_press(self._got_key, suppress=False); return "break"
+
+    def _got_key(self, event):
+        if not self._lv: return
+        name = (event.name or "").lower()
+        self._lv.set(name); self.cfg[self._lk] = name
+        if self._ll: self._ll.config(fg=self.FG, highlightbackground="#2a2a35")
+        try: keyboard.unhook(self._kh)
+        except Exception: pass
+        self._lv = self._ll = self._lk = None
+        self.after(100, self._rebind)
+
+    def _cancel_listen(self):
+        if not self._lv: return
+        self._lv.set(self.cfg.get(self._lk, ""))
+        if self._ll: self._ll.config(fg=self.FG, highlightbackground="#2a2a35")
+        try: keyboard.unhook(self._kh)
+        except Exception: pass
+        self._lv = self._ll = self._lk = None
+
+    def _unfocus(self, event):
+        w = event.widget
+        if isinstance(w, (tk.Entry, tk.Spinbox, ttk.Combobox)): return
+        if any(s in str(w.winfo_class()).lower() for s in ("combobox", "popdown", "listbox")): return
+        try: self.focus_set()
+        except Exception: pass
+
+    def _rebind(self):
+        """One low-level global hook sets flags; actions run on the main thread."""
+        s = self._gather()
+        self._hk = {k: kbd_key(s.get(f"{k}_key", DEFAULTS[f"{k}_key"])) for k in ("start", "stop", "close", "snap")}
+        try:
+            if self._global_hook is not None: keyboard.unhook(self._global_hook)
+        except Exception: pass
+        def _on_event(e):
+            try:
+                if getattr(e, "event_type", None) != "down" or self._lv: return
+                nm = (e.name or "").lower()
+                if   nm == self._hk["start"]: self._hk_flags["start"] = True
+                elif nm == self._hk["stop"]:  self._hk_flags["stop"]  = True
+                elif nm == self._hk["close"]: self._hk_flags["close"] = True
+                elif nm == self._hk["snap"] and self._snap_armed: self._hk_flags["snap"] = True
+            except Exception: pass
+        try:
+            self._global_hook = keyboard.hook(_on_event)
+            self._log(f"Hotkeys → start '{self._hk['start']}'  stop '{self._hk['stop']}'  close '{self._hk['close']}'  snap '{self._hk['snap']}'")
+        except Exception as ex:
+            self._log(f"Hotkey hook FAILED: {ex}")
+
+    def _poll_hotkeys(self):
+        f = self._hk_flags
+        try:
+            if f["start"]: f["start"] = False; self._toggle()
+            if f["stop"]:
+                f["stop"] = False
+                if self.eng.running: self.eng.stop()
+            if f["snap"]: f["snap"] = False; self._do_snap()
+            if f["close"]: f["close"] = False; self._close(); return
+        except Exception: pass
+        self.after(40, self._poll_hotkeys)
+
+    # ── CALIBRATION ──
+    def _pick_stop(self):
+        if self._picking: return
+        self._picking = True
+        lab = self._setup_rows["stop_btn"]
+        self._log("Hover the RED part of the Stop button — capturing in 3s...")
+        for i, txt in enumerate(("3...", "2...", "1...")):
+            self.after(i*1000, lambda t=txt: lab.config(text=t, fg=self.ACC2))
+        self.after(3000, self._do_pick_stop)
+
+    def _do_pick_stop(self):
+        self._picking = False
+        import ctypes.wintypes as wt
+        pt = wt.POINT(); user32.GetCursorPos(ctypes.byref(pt))
+        x, y = pt.x, pt.y; c = sample(x, y)
+        lab = self._setup_rows["stop_btn"]
+        if not (c[0] > 150 and c[0] > c[1] + 50 and c[0] > c[2] + 40):
+            lab.config(text=f"not red {c} — retry", fg=self.DIM)
+            self._log(f"That pixel isn't red {c}. Hover the red button background, not the white text.")
+            return
+        self.cfg["stop_btn"] = [x, y]; self.cfg["stop_rgb"] = list(c)
+        rect = get_roblox_rect()
+        if rect:
+            rx, ry, rw, rh = rect
+            self.cfg.setdefault("_frac", {})["stop_btn"] = [(x-rx)/rw, (y-ry)/rh]
+            note = "window-relative"
+        else:
+            self.cfg.setdefault("_frac", {}).pop("stop_btn", None); note = "absolute (Roblox window not found)"
+        save_cfg(self.cfg)
+        lab.config(text=f"set {c}", fg=self.ACC)
+        self._log(f"Stop button saved at ({x},{y}) colour {c} [{note}]")
+
+    def _arm_snap(self):
+        self._snap_armed = True
+        self._setup_rows["reel_box"].config(text=f"press {self._hk['snap'].upper()} on the bite", fg=self.ACC2)
+        self._log(f"Armed — go fish. When the reel bar appears, press {self._hk['snap'].upper()}.")
+
+    def _do_snap(self):
+        self._snap_armed = False
+        try: img = ImageGrab.grab()
+        except Exception as e:
+            self._log(f"Screenshot failed: {e}"); return
+        self._open_box_drawer(img)
+
+    def _open_box_drawer(self, img):
+        W, H = img.size
+        ov = tk.Toplevel(self); ov.overrideredirect(True); ov.attributes("-topmost", True)
+        ov.geometry(f"{W}x{H}+0+0")
+        cv = tk.Canvas(ov, width=W, height=H, highlightthickness=0, cursor="crosshair"); cv.pack()
+        tkimg = ImageTk.PhotoImage(img); ov._img = tkimg
+        cv.create_image(0, 0, anchor="nw", image=tkimg)
+        cv.create_rectangle(W//2-470, 12, W//2+470, 60, fill="#000000", outline=self.ACC, width=2)
+        cv.create_text(W//2, 36, fill="white", font=("Consolas", 13, "bold"),
+                       text="Drag a TIGHT box around the dark reel bar (green zone + fish).  Release = save  •  Esc = cancel")
+        st = {"x0": None, "y0": None, "rect": None}
+        def press(e):
+            st["x0"], st["y0"] = e.x, e.y
+            if st["rect"]: cv.delete(st["rect"])
+            st["rect"] = cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#ff3344", width=2)
+        def drag(e):
+            if st["rect"] is not None: cv.coords(st["rect"], st["x0"], st["y0"], e.x, e.y)
+        def release(e):
+            if st["x0"] is None: return
+            x1, y1 = min(st["x0"], e.x), min(st["y0"], e.y)
+            x2, y2 = max(st["x0"], e.x), max(st["y0"], e.y)
+            ov.destroy()
+            if x2-x1 < 30 or y2-y1 < 6:
+                self._log("Box too small — click Snap Reel Bar and try again"); return
+            self._save_reel_box(x1, y1, x2-x1, y2-y1, img.crop((x1, y1, x2, y2)))
+        def cancel(e=None):
+            ov.destroy(); self._setup_rows["reel_box"].config(text="cancelled", fg=self.DIM)
+        cv.bind("<ButtonPress-1>", press); cv.bind("<B1-Motion>", drag); cv.bind("<ButtonRelease-1>", release)
+        ov.bind("<Escape>", cancel); ov.focus_force()
+        try: ov.grab_set()
+        except Exception: pass
+
+    def _save_reel_box(self, x, y, w, h, crop):
+        self.cfg["reel_box"] = [x, y, w, h]
+        rect = get_roblox_rect()
+        if rect:
+            rx, ry, rw, rh = rect
+            self.cfg.setdefault("_frac", {})["reel_box"] = [(x-rx)/rw, (y-ry)/rh, w/rw, h/rh]
+            note = "window-relative"
+        else:
+            self.cfg.setdefault("_frac", {}).pop("reel_box", None); note = "absolute"
+        save_cfg(self.cfg)
+        r = analyze_img(crop)
+        if r["active"]:
+            self._setup_rows["reel_box"].config(text=f"set {w}x{h} ✓", fg=self.ACC)
+            fish = f"fish at {r['fish']}" if r["fish"] is not None else "fish NOT seen (ok if it was inside the zone)"
+            self._log(f"Reel bar saved {w}x{h} [{note}] — green {r['g0']}-{r['g1']} of {r['W']}, {fish}")
+        else:
+            self._setup_rows["reel_box"].config(text=f"set {w}x{h} (?)", fg=self.ACC2)
+            self._log("Saved, but no green zone found in that box — make sure it covers the dark bar while the bite is up.")
+
+    def _test_detect(self):
+        box = resolve_box(self.cfg, "reel_box")
+        if box:
+            r = analyze_box(box)
+            self._log(f"Reel bar: {'ACTIVE' if r['active'] else 'not visible'}  zone {r['g0']}-{r['g1']}  fish {r['fish']}")
+        else:
+            self._log("Reel bar not set")
+        pt = resolve_point(self.cfg, "stop_btn"); rgb = self.cfg.get("stop_rgb")
+        if pt and rgb:
+            c = sample(*pt); ok = color_close(c, rgb, int(self._gather().get("color_tol", 45)))
+            self._log(f"Stop button: {c} vs saved {tuple(rgb)} → {'WAITING FOR BITE' if ok else 'not showing'}")
+        else:
+            self._log("Stop button not set")
+
+    def _startup_checks(self):
+        if not self.cfg.get("reel_box") or not self.cfg.get("stop_btn"):
+            self._log("⚠ Not fully set up — open SETUP below.")
+        else:
+            self._log("Ready. Click into Roblox at a fishing spot and press START.")
+
+    # ── SETTINGS ──
+    def _gather(self):
+        s = dict(self.cfg)
+        for k, (var, cast) in self._v.items():
+            try:
+                val = var.get()
+                s[k] = val.strip() if isinstance(val, str) and cast is str else cast(val)
+            except Exception: pass
+        s["overlay_opacity"] = self._ov_opacity.get() if hasattr(self, "_ov_opacity") else s.get("overlay_opacity", 0.88)
+        s["ui_theme"] = self._theme_var.get() if hasattr(self, "_theme_var") else s.get("ui_theme", "default")
+        return s
+
+    def _save(self):
+        self.cfg = self._gather(); save_cfg(self.cfg)
+        if self.eng.running: self.eng.cfg.update(self.cfg)
+        self._log("Settings saved."); self._rebind()
+
+    def _toggle(self):
+        if self.eng.running: self.eng.stop()
+        else:
+            self.cfg = self._gather(); self.eng.start(self.cfg)
+
+    def _change_theme(self, e=None):
+        import tkinter.messagebox as mb
+        self.cfg["ui_theme"] = self._theme_var.get(); save_cfg(self.cfg)
+        mb.showinfo("Theme Changed", f"Theme set to '{self.cfg['ui_theme']}'\nRestart to apply.", parent=self)
+
+    # ── LOGGING (thread-safe queue) ──
+    def _log(self, msg):
+        self._log_lines.append(msg); self._log_pending.append(msg)
+
+    def _drain_logs(self):
+        try:
+            last = None; n = 0
+            while self._log_pending and n < 150:
+                last = self._log_pending.popleft(); n += 1
+                if self._log_open:
+                    self._log_panel.config(state="normal"); self._log_panel.insert("end", last + "\n")
+                    self._log_panel.config(state="disabled")
+            if last is not None:
+                self._status_line.config(text=last[:48])
+                if self._log_open:
+                    lines = int(self._log_panel.index('end-1c').split('.')[0])
+                    if lines > 400:
+                        self._log_panel.config(state="normal"); self._log_panel.delete("1.0", f"{lines-300}.0")
+                        self._log_panel.config(state="disabled")
+                    self._log_panel.see("end")
+                if self._overlay and self._overlay.winfo_exists():
+                    self._ov_action.config(text=last[:38])
+        except Exception: pass
+        self.after(80, self._drain_logs)
+
+    def _toggle_log(self):
+        if self._log_open:
+            self._log_panel.pack_forget(); self._log_open = False
+        else:
+            self._log_panel.pack(fill="x", padx=20, pady=(0, 6), after=self._status_card); self._log_open = True
+            self._log_panel.config(state="normal"); self._log_panel.delete("1.0", "end")
+            for line in list(self._log_lines)[-100:]: self._log_panel.insert("end", line + "\n")
+            self._log_panel.see("end"); self._log_panel.config(state="disabled")
+        self._draw_log_icon()
+
+    # ── STATUS / STATS ──
+    def _set_status(self, active):
+        def _do():
+            if active:
+                self._dot.config(fg=self.ACC); self._slbl.config(fg=self.FG, text="  FISHING")
+                self._btn.config(text="STOP", bg="#333340"); self._session_start = self._session_start or time.time()
+            else:
+                self._dot.config(fg="#2a2a35"); self._slbl.config(fg=self.DIM, text="  OFFLINE")
+                self._btn.config(text="START", bg=self.ACC); self._session_start = None
+            if self._overlay and self._overlay.winfo_exists():
+                col = self.ACC if active else self.DIM
+                self._ov_dot.config(fg=col); self._ov_lbl.config(text="FISHING" if active else "OFFLINE", fg=col)
+                self._ov_toggle.config(text="STOP" if active else "START", bg=self.CARD if active else self.ACC)
+        self.after(0, _do)
+
+    def _set_catches(self, n):
+        self._catch_count = n   # read by _tick_session on the main thread
+
+    def _tick_session(self):
+        if self.eng.running and self._session_start:
+            m, s = divmod(int(time.time() - self._session_start), 60); h, m = divmod(m, 60)
+            self._session_lbl.config(text=f"⏱ {h}:{m:02d}:{s:02d}" if h else f"⏱ {m}:{s:02d}")
+        else:
+            self._session_lbl.config(text="")
+        self._catch_lbl.config(text=f"🐟 {self._catch_count}")
+        if self._overlay and self._overlay.winfo_exists():
+            self._ov_catch.config(text=f"🐟 {self._catch_count}")
+        self.after(500, self._tick_session)
+
+    # ── OVERLAY ──
+    def _update_ov_opacity(self, val=None):
+        if self._overlay and self._overlay.winfo_exists():
+            self._overlay.attributes("-alpha", self._ov_opacity.get())
+
+    def _toggle_overlay(self):
+        if self._overlay and self._overlay.winfo_exists():
+            self.cfg["overlay_x"] = self._overlay.winfo_x(); self.cfg["overlay_y"] = self._overlay.winfo_y()
+            self._overlay.destroy(); self._overlay = None; self._overlay_btn.config(bg=self.ACC); return
+        B, A, D, C = self.BG, self.ACC, self.DIM, self.CARD
+        ov = tk.Toplevel(self); ov.overrideredirect(True); ov.attributes("-topmost", True)
+        ov.attributes("-alpha", self._ov_opacity.get())
+        x = max(0, min(self.cfg.get("overlay_x", 20), self.winfo_screenwidth() - 60))
+        y = max(0, min(self.cfg.get("overlay_y", 20), self.winfo_screenheight() - 60))
+        ov.geometry(f"+{x}+{y}"); ov.config(bg=B)
+        ov._dx = ov._dy = 0
+        def ds(e): ov._dx, ov._dy = e.x, e.y
+        def dm(e): ov.geometry(f"+{ov.winfo_x()+e.x-ov._dx}+{ov.winfo_y()+e.y-ov._dy}")
+        def drag(w): w.bind("<ButtonPress-1>", ds); w.bind("<B1-Motion>", dm)
+        tk.Frame(ov, bg=A, height=2).pack(fill="x")
+        top = tk.Frame(ov, bg=B); top.pack(fill="x", padx=6, pady=(3, 0)); drag(top)
+        t = tk.Label(top, text=f"{APP_TITLE}  {VERSION}", bg=B, fg=D, font=("Consolas", 7, "bold")); t.pack(side="left"); drag(t)
+        cl = tk.Label(top, text="✕", bg=B, fg=D, font=("Consolas", 9), cursor="hand2"); cl.pack(side="right")
+        cl.bind("<Button-1>", lambda e: self._toggle_overlay())
+        mid = tk.Frame(ov, bg=B); mid.pack(fill="x", padx=8, pady=(4, 1)); drag(mid)
+        active = self.eng.running; col = A if active else D
+        self._ov_dot = tk.Label(mid, text="●", bg=B, fg=col, font=("Consolas", 16)); self._ov_dot.pack(side="left"); drag(self._ov_dot)
+        self._ov_lbl = tk.Label(mid, text="FISHING" if active else "OFFLINE", bg=B, fg=col, font=("Consolas", 10, "bold"))
+        self._ov_lbl.pack(side="left", padx=(4, 0)); drag(self._ov_lbl)
+        self._ov_catch = tk.Label(mid, text=f"🐟 {self._catch_count}", bg=B, fg=self.ACC2, font=("Consolas", 9, "bold"))
+        self._ov_catch.pack(side="left", padx=8)
+        self._ov_toggle = tk.Button(mid, text="STOP" if active else "START", bg=C if active else A, fg="white",
+                                    font=("Consolas", 8, "bold"), relief="flat", padx=10, pady=2, cursor="hand2",
+                                    command=self._toggle)
+        self._ov_toggle.pack(side="right")
+        self._ov_action = tk.Label(ov, text="—", bg=B, fg=D, font=("Consolas", 7), anchor="w", width=38)
+        self._ov_action.pack(fill="x", padx=8, pady=(0, 4)); drag(self._ov_action)
+        self._overlay = ov; self._overlay_btn.config(bg=self.ACC2)
+
+    def _close(self):
+        self.eng.stop()
+        try:
+            if self._overlay and self._overlay.winfo_exists():
+                self.cfg["overlay_x"] = self._overlay.winfo_x(); self.cfg["overlay_y"] = self._overlay.winfo_y()
+        except Exception: pass
+        save_cfg(self._gather())
+        try: keyboard.unhook_all()
+        except Exception: pass
+        self.destroy(); sys.exit(0)
+
+if __name__ == "__main__":
+    App().mainloop()
